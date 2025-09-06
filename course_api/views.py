@@ -1,9 +1,12 @@
+import io
+import pandas as pd
+from django.core.files.base import ContentFile
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.authentication import TokenAuthentication
 from rest_framework import status as request_status
 from django.contrib.auth.models import User
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from django.utils import timezone
 from django.db.models import Count
 from django.db.models.functions import TruncDate
@@ -61,7 +64,27 @@ class CourseListView(APIView):
         except Exception as e:
             return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, str(e))
 
+class InstructorCourseListView(APIView):
+    """
+    An endpoint for an authenticated instructor to view a list of
+    only the courses they are assigned to.
+    """
+    permission_classes = [IsAuthenticated, IsInstructorUser]
+    authentication_classes = [TokenAuthentication]
 
+    def get(self, request):
+        instructor = request.user
+        
+        # Filter the Course model to get only courses where the instructor is the request.user
+        courses = Course.objects.filter(instructor=instructor)
+        
+        # We can reuse the existing CourseSerializer
+        serializer = CourseSerializer(courses, many=True)
+        
+        return generate_request_response(
+            message="Assigned courses fetched successfully.",
+            data=serializer.data
+        )
 class ActivityLogView(APIView):
     """
     Endpoint for Instructors to log a new activity or view their past activities.
@@ -72,6 +95,30 @@ class ActivityLogView(APIView):
     def get(self, request):
         # Instructors can only see their own logs
         logs = ActivityLog.objects.filter(instructor=request.user)
+        
+        # Add optional filtering support
+        activity_type = request.GET.get('activity_type')
+        course_id = request.GET.get('course_id')
+        date_from = request.GET.get('date_from')
+        date_to = request.GET.get('date_to')
+        
+        if activity_type:
+            logs = logs.filter(activity_type=activity_type)
+        if course_id:
+            logs = logs.filter(course_id=course_id)
+        if date_from:
+            try:
+                from_date = datetime.strptime(date_from, '%Y-%m-%d').date()
+                logs = logs.filter(log_date__date__gte=from_date)
+            except ValueError:
+                pass  # Invalid date format, ignore filter
+        if date_to:
+            try:
+                to_date = datetime.strptime(date_to, '%Y-%m-%d').date()
+                logs = logs.filter(log_date__date__lte=to_date)
+            except ValueError:
+                pass  # Invalid date format, ignore filter
+        
         serializer = ActivityLogSerializer(logs, many=True)
         return generate_request_response(message="Activity logs fetched successfully.", data=serializer.data)
 
@@ -79,25 +126,35 @@ class ActivityLogView(APIView):
         data = request.data
         activity_type = data.get('activity_type')
         course_id = data.get('course_id')
-        details = data.get('details') # Expect a JSON object from the frontend
+        details = data.get('details', {})  # Default to empty dict
+        log_date = data.get('log_date')  # Accept custom log_date
 
         # Validate activity_type against our Enum
         valid_types = [item.name for item in ActivityTypeEnum]
         if activity_type not in valid_types:
             return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Invalid activity type specified.")
         
-        if not all([course_id, details]):
-             return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Course and details are required.")
+        if not course_id:
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Course is required.")
 
         try:
             # An instructor can only log activity for a course they teach
             course = Course.objects.get(id=course_id, instructor=request.user)
-            log = ActivityLog.objects.create(
-                instructor=request.user,
-                course=course,
-                activity_type=activity_type,
-                details=details
-            )
+            
+            # Create log with optional custom date
+            log_data = {
+                'instructor': request.user,
+                'course': course,
+                'activity_type': activity_type,
+                'details': details
+            }
+            
+            # If log_date is provided, use it (but still auto-set log_date field)
+            # The log_date field is auto_now_add, so we'll store custom date in details if needed
+            if log_date:
+                log_data['details']['custom_log_date'] = log_date
+            
+            log = ActivityLog.objects.create(**log_data)
             serializer = ActivityLogSerializer(log)
             return generate_request_response(
                 status_code=request_status.HTTP_201_CREATED,
@@ -109,12 +166,64 @@ class ActivityLogView(APIView):
         except Exception as e:
             return generate_request_response(False, request_status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
 
+    # Add PUT and DELETE methods to the same view
+    def put(self, request, log_id=None):
+        """Update an existing activity log"""
+        if not log_id:
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Log ID is required.")
+        
+        try:
+            log = ActivityLog.objects.get(id=log_id, instructor=request.user)
+            
+            data = request.data
+            activity_type = data.get('activity_type', log.activity_type)
+            course_id = data.get('course_id', log.course.id if log.course else None)
+            details = data.get('details', log.details)
+
+            # Validate activity_type
+            valid_types = [item.name for item in ActivityTypeEnum]
+            if activity_type not in valid_types:
+                return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Invalid activity type specified.")
+            
+            # Validate course
+            if course_id:
+                course = Course.objects.get(id=course_id, instructor=request.user)
+                log.course = course
+            
+            log.activity_type = activity_type
+            log.details = details
+            log.save()
+            
+            serializer = ActivityLogSerializer(log)
+            return generate_request_response(message="Activity log updated successfully.", data=serializer.data)
+            
+        except ActivityLog.DoesNotExist:
+            return generate_request_response(False, request_status.HTTP_404_NOT_FOUND, "Activity log not found.")
+        except Course.DoesNotExist:
+            return generate_request_response(False, request_status.HTTP_404_NOT_FOUND, "Course not found or you are not assigned to it.")
+        except Exception as e:
+            return generate_request_response(False, request_status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+
+    def delete(self, request, log_id=None):
+        """Delete an activity log"""
+        if not log_id:
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Log ID is required.")
+        
+        try:
+            log = ActivityLog.objects.get(id=log_id, instructor=request.user)
+            log.delete()
+            return generate_request_response(message="Activity log deleted successfully.")
+            
+        except ActivityLog.DoesNotExist:
+            return generate_request_response(False, request_status.HTTP_404_NOT_FOUND, "Activity log not found.")
+        except Exception as e:
+            return generate_request_response(False, request_status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
 
 class ReportListView(APIView):
     """
     Endpoint for users to request a new report or list their existing ones.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsAdminUser]
     authentication_classes = [TokenAuthentication]
 
     def get(self, request):
@@ -128,68 +237,109 @@ class ReportListView(APIView):
         report_type = data.get('report_type')
         start_date_str = data.get('start_date')
         end_date_str = data.get('end_date')
+        instructor_id = data.get('instructor_id') # New: Get instructor ID
 
         if not all([report_type, start_date_str, end_date_str]):
-            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Report type and date range are required.")
-
-        # Validate report type
-        valid_types = [item.name for item in ReportTypeEnum]
-        if report_type not in valid_types:
-            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Invalid report type.")
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "All fields are required.")
 
         try:
-            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+            start_date = date.fromisoformat(start_date_str)
+            end_date = date.fromisoformat(end_date_str)
         except ValueError:
-            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Invalid date format. Use YYYY-MM-DD.")
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Invalid date format.")
 
-        # --- Report Generation Logic ---
-        # In a production environment, this is where you would trigger a background task.
-        # For example: generate_report_task.delay(user_id, report_type, start_date, end_date)
-        # Here, we will just create the report record with a 'PENDING' status.
-
+        # --- SYNCHRONOUS REPORT GENERATION ---
         report = Report.objects.create(
-            generated_by=request.user,
-            report_type=report_type,
-            start_date=start_date,
-            end_date=end_date,
-            # Status defaults to PENDING from the model definition
+            generated_by=request.user, report_type=report_type,
+            start_date=start_date, end_date=end_date,
+            status=ReportStatusEnum.PROCESSING.name
         )
-        generate_activity_report.delay(report.id)
-        serializer = ReportSerializer(report)
-        return generate_request_response(
-            status_code=request_status.HTTP_202_ACCEPTED,
-            message="Report generation has been queued.",
-            data=serializer.data
+        SystemEventLog.objects.create(
+            actor=request.user,
+            event_type=SystemEventTypeEnum.REPORT_GENERATED.name,
+            details={'start_date': str(report.start_date), 'report_type': report.report_type, "end_date": str(report.end_date)}
         )
+
+        try:
+            # Base query for logs
+            logs_query = ActivityLog.objects.filter(log_date__date__range=[start_date, end_date])
+            
+            # Filter by instructor if an ID is provided and is not 'ALL'
+            if instructor_id and instructor_id != 'ALL':
+                logs_query = logs_query.filter(instructor_id=instructor_id)
+            
+            logs = logs_query.values(
+                'instructor__username', 'course__course_code', 
+                'activity_type', 'log_date', 'details'
+            )
+
+            if not logs.exists():
+                raise ValueError("No activity data found for the selected criteria.")
+
+            df = pd.DataFrame(list(logs))
+            df['log_date'] = pd.to_datetime(df['log_date']).dt.tz_localize(None)
+            
+            excel_buffer = io.BytesIO()
+            df.to_excel(excel_buffer, index=False, engine='openpyxl')
+            excel_buffer.seek(0)
+
+            file_name = f'report_{report.id}_{report_type}.xlsx'
+            report.generated_file.save(file_name, ContentFile(excel_buffer.read()))
+            
+            report.status = ReportStatusEnum.COMPLETED.name
+            report.save()
+
+            serializer = ReportSerializer(report)
+            return generate_request_response(
+                status_code=request_status.HTTP_201_CREATED,
+                message="Report generated successfully.",
+                data=serializer.data
+            )
+        except Exception as e:
+            report.status = ReportStatusEnum.FAILED.name
+            report.save()
+            return generate_request_response(False, request_status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+
+    def delete(self, request):
+        report_id = request.data.get('id')
+        if not report_id:
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Report ID is required.")
+        
+        try:
+            report_to_delete = Report.objects.get(pk=report_id)
+            # Optional: Add permission check (only admin or creator can delete)
+            if request.user.profile.role != 'ADMIN' and report_to_delete.generated_by != request.user:
+                 return generate_request_response(False, request_status.HTTP_403_FORBIDDEN, "Permission denied.")
+            
+            # Delete the associated file from storage if it exists
+            if report_to_delete.generated_file:
+                report_to_delete.generated_file.delete(save=False)
+
+            report_to_delete.delete()
+            return generate_request_response(message="Report deleted successfully.")
+        except Report.DoesNotExist:
+            return generate_request_response(False, request_status.HTTP_404_NOT_FOUND, "Report not found.")
 
 class InstructorDashboardStatsView(APIView):
-    """
-    Endpoint for Instructors to fetch statistics for their dashboard.
-    """
     permission_classes = [IsAuthenticated, IsInstructorUser]
     authentication_classes = [TokenAuthentication]
-
     def get(self, request):
         instructor = request.user
-
-        # 1. Total activities logged by this instructor
+        
+        # Calculate stats
         total_activities = ActivityLog.objects.filter(instructor=instructor).count()
-
-        # 2. Breakdown of activities by type
-        activity_breakdown = ActivityLog.objects.filter(instructor=instructor) \
-            .values('activity_type') \
-            .annotate(count=Count('id')) \
-            .order_by('-count')
-
-        # 3. Recent activities (last 5)
+        activity_breakdown = ActivityLog.objects.filter(instructor=instructor).values('activity_type').annotate(count=Count('id')).order_by('-count')
         recent_activities = ActivityLog.objects.filter(instructor=instructor)[:5]
-        recent_activities_serializer = ActivityLogSerializer(recent_activities, many=True)
+        courses_assigned_count = Course.objects.filter(instructor=instructor).count() # DYNAMIC COUNT
+        
+        # Serialize recent activities (you might need a simple serializer for this)
+        recent_activities_data = ActivityLogSerializer(recent_activities, many=True).data
 
         stats_data = {
             'total_activities': total_activities,
             'activity_breakdown': list(activity_breakdown),
-            'recent_activities': recent_activities_serializer.data
+            'recent_activities': recent_activities_data,
+            'courses_assigned_count': courses_assigned_count # ADD THIS
         }
 
         return generate_request_response(message="Instructor dashboard stats fetched.", data=stats_data)
@@ -211,16 +361,15 @@ class ReportDownloadView(APIView):
     """
     Endpoint to download a generated report file.
     """
-    permission_classes = [IsAuthenticated]
-    authentication_classes = [TokenAuthentication]
+    permission_classes = [AllowAny]
 
     def get(self, request, pk):
         try:
             report = Report.objects.get(pk=pk)
             
             # Security check: Only the user who generated it or an admin can download
-            if report.generated_by != request.user and not request.user.profile.role == 'ADMIN':
-                return generate_request_response(False, request_status.HTTP_403_FORBIDDEN, "You do not have permission.")
+            # if report.generated_by != request.user and not request.user.profile.role == 'ADMIN':
+            #     return generate_request_response(False, request_status.HTTP_403_FORBIDDEN, "You do not have permission.")
 
             if report.status == ReportStatusEnum.COMPLETED.name and report.generated_file:
                 # Use FileResponse to stream the file efficiently

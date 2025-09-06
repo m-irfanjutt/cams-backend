@@ -1,4 +1,6 @@
 # authentication/views.py
+import csv
+from django.http import HttpResponse
 from django.contrib.auth import authenticate
 from django.db import transaction
 from django.contrib.auth.models import User
@@ -14,6 +16,8 @@ from .models import Profile, Department, RoleEnum
 from .serializers import UserSerializer, DepartmentSerializer
 from .permissions import IsAdminUser
 from course_api.models import ReportTypeEnum, ReportStatusEnum, Report, SystemEventLog, SystemEventTypeEnum
+from datetime import timedelta
+from django.utils import timezone
 
 class RegisterView(APIView):
     """
@@ -159,6 +163,62 @@ class UserListView(APIView):
         serializer = UserSerializer(users, many=True)
         return generate_request_response(message="Users fetched successfully.", data=serializer.data)
 
+    @transaction.atomic
+    def post(self, request):
+        data = request.data
+        email = data.get('email')
+        username = data.get('username')
+        password = data.get('password') # Get password from form
+
+        if not all([email, username, data.get('first_name'), data.get('last_name'), password]):
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Missing required fields, including password.")
+        
+        if User.objects.filter(username=username).exists():
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Username already exists.")
+        
+        if User.objects.filter(email=email).exists():
+            return generate_request_response(False, request_status.HTTP_400_BAD_REQUEST, "Email is already in use.")
+
+        try:
+            department = Department.objects.get(id=data.get('department_id'))
+            
+            # 1. Create the user
+            user = User.objects.create(
+                username=username,
+                email=email,
+                first_name=data.get('first_name'),
+                last_name=data.get('last_name'),
+                is_active=True
+            )
+            # 2. Set the password provided by the admin
+            user.set_password(password)
+            user.save()
+
+            # 3. Create the profile
+            Profile.objects.create(
+                user=user,
+                role=data.get('role', 'INSTRUCTOR'),
+                department=department
+            )
+            
+            # Log the event
+            SystemEventLog.objects.create(
+                actor=request.user,
+                event_type=SystemEventTypeEnum.USER_CREATED.name,
+                details={'user_id': user.id, 'username': user.username}
+            )
+
+            serializer = UserSerializer(user)
+            return generate_request_response(
+                status_code=request_status.HTTP_201_CREATED,
+                message=f"User '{user.username}' created successfully.",
+                data=serializer.data
+            )
+        except Department.DoesNotExist:
+            return generate_request_response(False, request_status.HTTP_404_NOT_FOUND, "Department not found.")
+        except Exception as e:
+            return generate_request_response(False, request_status.HTTP_500_INTERNAL_SERVER_ERROR, str(e))
+
 class UserDetailManageView(APIView):
     """
     Endpoint for Admins to retrieve or update a specific user's details.
@@ -232,44 +292,72 @@ class UserDetailManageView(APIView):
         )
         return generate_request_response(status_code=request_status.HTTP_204_NO_CONTENT, message="User deleted successfully.")
 
+def calculate_growth(current_count, previous_count):
+    """Helper function to calculate percentage growth and handle division by zero."""
+    if previous_count == 0:
+        return 100.0 if current_count > 0 else 0.0
+    return round(((current_count - previous_count) / previous_count) * 100, 1)
+
+
 class AdminDashboardStatsView(APIView):
-    """
-    Endpoint for Admins to fetch aggregated statistics for the dashboard.
-    """
     permission_classes = [IsAuthenticated, IsAdminUser]
     authentication_classes = [TokenAuthentication]
 
     def get(self, request):
-        # 1. Total Users
+        today = timezone.now().date()
+        start_of_this_month = today.replace(day=1)
+        start_of_last_month = (start_of_this_month - timedelta(days=1)).replace(day=1)
+
+        # Current Counts
         total_users = User.objects.count()
-
-        # 2. Active Instructors
-        active_instructors = User.objects.filter(
-            is_active=True, 
-            profile__role=RoleEnum.INSTRUCTOR.value
-        ).count()
-
-        # 3. Reports Generated (we'll count completed reports)
+        active_instructors = User.objects.filter(is_active=True, profile__role=RoleEnum.INSTRUCTOR.value).count()
         reports_generated = Report.objects.filter(status=ReportStatusEnum.COMPLETED.name).count()
 
-        # 4. System Performance / Uptime
-        # This metric is typically provided by external monitoring tools or hosting platforms (e.g., AWS CloudWatch).
-        # It's not something the Django application can calculate itself.
-        # We will return a mock value and assume the frontend knows how to display it.
-        system_uptime = 99.9  # Mock value
+        # Previous Month Counts
+        prev_total_users = User.objects.filter(date_joined__lt=start_of_this_month).count()
+        prev_active_instructors = User.objects.filter(is_active=True, profile__role=RoleEnum.INSTRUCTOR.value, date_joined__lt=start_of_this_month).count()
+        prev_reports_generated = Report.objects.filter(status=ReportStatusEnum.COMPLETED.name, generated_at__lt=start_of_this_month).count()
 
-        # Assemble the data into a dictionary
+        # Assemble the data
         stats_data = {
             'total_users': total_users,
+            'total_users_growth': calculate_growth(total_users, prev_total_users),
             'active_instructors': active_instructors,
+            'active_instructors_growth': calculate_growth(active_instructors, prev_active_instructors),
             'reports_generated': reports_generated,
-            'system_performance': {
-                'uptime_percentage': system_uptime
-            }
+            'reports_generated_growth': calculate_growth(reports_generated, prev_reports_generated),
+            'system_performance': {'uptime_percentage': 99.9} # Uptime remains a mock/external value
         }
 
-        return generate_request_response(
-            message="Dashboard statistics fetched successfully.",
-            data=stats_data
-        )
+        return generate_request_response(message="Dashboard statistics fetched successfully.", data=stats_data)
 
+class UserExportView(APIView):
+    """
+    Endpoint for Admins to export all user data as a CSV file.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="cams_users.csv"'
+
+        writer = csv.writer(response)
+        # Write the header row
+        writer.writerow(['ID', 'Username', 'First Name', 'Last Name', 'Email', 'Role', 'Department', 'Status', 'Last Login'])
+
+        # Write data rows
+        users = User.objects.all().select_related('profile__department')
+        for user in users:
+            writer.writerow([
+                user.id,
+                user.username,
+                user.first_name,
+                user.last_name,
+                user.email,
+                user.profile.role,
+                user.profile.department.name if user.profile.department else 'N/A',
+                'Active' if user.is_active else 'Inactive',
+                user.last_login.strftime("%Y-%m-%d %H:%M:%S") if user.last_login else 'N/A'
+            ])
+        
+        return response

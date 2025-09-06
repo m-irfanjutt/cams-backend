@@ -7,7 +7,8 @@ from .views import (
     DepartmentListView,
     UserListView,
     UserDetailManageView,
-    AdminDashboardStatsView
+    AdminDashboardStatsView,
+    UserExportView
 )
 
 urlpatterns = [
@@ -18,5 +19,6 @@ urlpatterns = [
     path('departments/', DepartmentListView.as_view(), name='department-list'),
     path('users/', UserListView.as_view(), name='user-list'),
     path('users/<int:pk>/', UserDetailManageView.as_view(), name='user-detail-manage'),
+    path('users/export/', UserExportView.as_view(), name='user-export'),
     path('dashboard/stats/', AdminDashboardStatsView.as_view(), name='admin-dashboard-stats'),
 ]

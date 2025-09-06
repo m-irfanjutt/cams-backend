@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import CourseListView, ActivityLogView, ReportListView, InstructorDashboardStatsView, SystemEventLogView, CourseDetailManageView, ReportDownloadView, AdminAnalyticsView, ActivityLogDetailView, InstructorPerformanceView
+from .views import CourseListView, ActivityLogView, ReportListView, InstructorDashboardStatsView, SystemEventLogView, CourseDetailManageView, ReportDownloadView, AdminAnalyticsView, ActivityLogDetailView, InstructorPerformanceView, InstructorCourseListView
 
 urlpatterns = [
     # Dashboard URLs
@@ -9,6 +9,8 @@ urlpatterns = [
     # Course URLs
     path('courses/', CourseListView.as_view(), name='course-list'),
     path('courses/<int:pk>/', CourseDetailManageView.as_view(), name='course-detail'),
+    
+    path('instructor/courses/', InstructorCourseListView.as_view(), name='instructor-course-list'),
     
     # Activity Log URLs
     path('activities/', ActivityLogView.as_view(), name='activity-log'),

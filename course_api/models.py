@@ -5,13 +5,13 @@ from django.contrib.auth.models import User
 # --- Enums for Choices ---
 
 class ActivityTypeEnum(enum.Enum):
-    MDB_REPLY = 'MDB Replies'
-    TICKET_RESPONSE = 'Ticket Responses'
-    ASSIGNMENT_UPLOAD = 'Assignment Upload'
-    ASSIGNMENT_MARKING = 'Assignment Marking'
-    GDB_MARKING = 'GDB Marking'
-    SESSION_TRACKING = 'Session Tracking'
-    EMAIL_RESPONSE = 'Email Responses'
+    MDB_REPLIES = 'MDB_REPLIES'
+    TICKET_RESPONSES = 'TICKET_RESPONSES'
+    ASSIGNMENT_UPLOAD = 'ASSIGNMENT_UPLOAD'
+    ASSIGNMENT_MARKING = 'ASSIGNMENT_MARKING'
+    GDB_MARKING = 'GDB_MARKING'
+    WEEKLY_SESSION = 'WEEKLY_SESSION'
+    EMAIL_RESPONSES = 'EMAIL_RESPONSES'
     
     @classmethod
     def choices(cls):
@@ -29,6 +29,7 @@ class ReportTypeEnum(enum.Enum):
 class ReportStatusEnum(enum.Enum):
     PENDING = 'Pending'
     COMPLETED = 'Completed'
+    PROCESSING = "Processing"
     FAILED = 'Failed'
 
     @classmethod
